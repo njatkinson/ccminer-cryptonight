@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include "cuda.h"
 #include "cuda_runtime.h"
 
@@ -172,10 +173,19 @@ extern bool opt_benchmark;
 extern bool stop_mining;
 extern volatile bool mining_has_stopped[MAX_GPU];
 
+extern void cryptonight_core_cpu_init(int thr_id, int threads);
+extern void cryptonight_core_cpu_hash(int thr_id, int blocks, int threads, uint32_t *d_long_state, struct cryptonight_gpu_ctx *d_ctx);
+
+extern void cryptonight_extra_cpu_setData(int thr_id, const void *data, const void *pTargetIn);
+extern void cryptonight_extra_cpu_init(int thr_id, int dlen);
+extern void cryptonight_extra_cpu_prepare(int thr_id, int threads, uint32_t startNonce, struct cryptonight_gpu_ctx *d_ctx);
+extern void cryptonight_extra_cpu_final(int thr_id, int threads, uint32_t startNonce, uint32_t *nonce, struct cryptonight_gpu_ctx *d_ctx);
 
 extern "C" void cryptonight_hash(void* output, const void* input, size_t len);
 
-extern "C" int scanhash_cryptonight(int thr_id, uint32_t *pdata, const uint32_t *ptarget, uint32_t max_nonce, unsigned long *hashes_done, uint32_t *results)
+extern "C" int scanhash_cryptonight(int thr_id, uint32_t *pdata, int dlen,
+    const uint32_t *ptarget, uint32_t max_nonce,
+    unsigned long *hashes_done)
 {
 	cudaError_t err;
 	int res;
@@ -202,31 +212,19 @@ extern "C" int scanhash_cryptonight(int thr_id, uint32_t *pdata, const uint32_t 
 	static bool init[MAX_GPU] = {false, false, false, false, false, false, false, false};
 	if(!init[thr_id])
 	{
-		err = cudaSetDevice(device_map[thr_id]);
-		if(err != cudaSuccess)
-		{
-			applog(LOG_ERR, "GPU %d: %s", device_map[thr_id], cudaGetErrorString(err));
-		}
-		cudaDeviceReset();
-		cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
-		cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
-		cudaMalloc(&d_long_state[thr_id], alloc);
-		exit_if_cudaerror(thr_id, __FILE__, __LINE__);
-		cudaMalloc(&d_ctx_state[thr_id], 50 * sizeof(uint32_t) * throughput);
-		exit_if_cudaerror(thr_id, __FILE__, __LINE__);
-		cudaMalloc(&d_ctx_key1[thr_id], 40 * sizeof(uint32_t) * throughput);
-		exit_if_cudaerror(thr_id, __FILE__, __LINE__);
-		cudaMalloc(&d_ctx_key2[thr_id], 40 * sizeof(uint32_t) * throughput);
-		exit_if_cudaerror(thr_id, __FILE__, __LINE__);
-		cudaMalloc(&d_ctx_text[thr_id], 32 * sizeof(uint32_t) * throughput);
-		exit_if_cudaerror(thr_id, __FILE__, __LINE__);
-		cudaMalloc(&d_ctx_a[thr_id], 4 * sizeof(uint32_t) * throughput);
-		exit_if_cudaerror(thr_id, __FILE__, __LINE__);
-		cudaMalloc(&d_ctx_b[thr_id], 4 * sizeof(uint32_t) * throughput);
-		exit_if_cudaerror(thr_id, __FILE__, __LINE__);
-
-		cryptonight_extra_cpu_init(thr_id);
-
+        cudaSetDevice(device_map[thr_id]);
+        cudaDeviceReset();
+        cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+		if( cudaMalloc(&d_long_state[thr_id], alloc) != cudaSuccess ) {
+            applog(LOG_ERR, "GPU #%d: FATAL: failed to allocate device memory for long state", thr_id);
+            exit(1);
+        }
+		if( cudaMalloc(&d_ctx[thr_id], sizeof(struct cryptonight_gpu_ctx) * throughput) != cudaSuccess ) {
+            applog(LOG_ERR, "GPU #%d: FATAL: failed to allocate device memory for hash context", thr_id);
+            exit(1);
+        }
+		cryptonight_core_cpu_init(thr_id, throughput);
+        cryptonight_extra_cpu_init(thr_id, dlen);
 		init[thr_id] = true;
 	}
 
@@ -242,9 +240,12 @@ extern "C" int scanhash_cryptonight(int thr_id, uint32_t *pdata, const uint32_t 
 
 		if(stop_mining)
 		{
-			mining_has_stopped[thr_id] = true;
-			pthread_exit(NULL);
-		}
+			uint32_t vhash64[8];
+            uint32_t tempdata[32];
+            uint32_t *tempnonceptr = (uint32_t*)(((char*)tempdata) + 39);
+            memcpy(tempdata, pdata, dlen);
+			*tempnonceptr = foundNonce;
+			cryptonight_hash(vhash64, tempdata, dlen);
 
 		if(foundNonce[0] < 0xffffffff)
 		{

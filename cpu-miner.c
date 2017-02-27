@@ -449,7 +449,83 @@ static bool jobj_binary(const json_t *obj, const char *key,
 	return true;
 }
 
-bool rpc2_job_decode(const json_t *job, struct work *work)
+bool rpc2_job_decode(const json_t *job, struct work *work) {
+    if (!jsonrpc_2) {
+        applog(LOG_ERR, "Tried to decode job without JSON-RPC 2.0");
+        return false;
+    }
+    json_t *tmp;
+    tmp = json_object_get(job, "job_id");
+    if (!tmp) {
+        applog(LOG_ERR, "JSON inval job id");
+        goto err_out;
+    }
+    const char *job_id = json_string_value(tmp);
+    tmp = json_object_get(job, "blob");
+    if (!tmp) {
+        applog(LOG_ERR, "JSON inval blob");
+        goto err_out;
+    }
+    const char *hexblob = json_string_value(tmp);
+    int blobLen = strlen(hexblob);
+    if (blobLen % 2 != 0 || ((blobLen / 2) < 40 && blobLen != 0) || (blobLen / 2) > 128) {
+        applog(LOG_ERR, "JSON invalid blob length");
+        goto err_out;
+    }
+    if (blobLen != 0) {
+        pthread_mutex_lock(&rpc2_job_lock);
+        char *blob = (char *)malloc(blobLen / 2);
+        if (!hex2bin((unsigned char *)blob, hexblob, blobLen / 2)) {
+            applog(LOG_ERR, "JSON inval blob");
+            pthread_mutex_unlock(&rpc2_job_lock);
+            goto err_out;
+        }
+        if (rpc2_blob) {
+            free(rpc2_blob);
+        }
+        rpc2_bloblen = blobLen / 2;
+        rpc2_blob = (char *)malloc(rpc2_bloblen);
+        memcpy(rpc2_blob, blob, blobLen / 2);
+
+        free(blob);
+
+        uint32_t target;
+        jobj_binary(job, "target", &target, 4);
+        if(rpc2_target != target) {
+            double hashrate = 0.;
+            pthread_mutex_lock(&stats_lock);
+            for (int i = 0; i < opt_n_threads; i++)
+                hashrate += thr_hashrates[i];
+            pthread_mutex_unlock(&stats_lock);
+            double difficulty = (((double) 0xffffffff) / target);
+            applog(LOG_INFO, "Pool set diff to %g", difficulty);
+            rpc2_target = target;
+        }
+
+        if (rpc2_job_id) {
+            free(rpc2_job_id);
+        }
+        rpc2_job_id = strdup(job_id);
+        pthread_mutex_unlock(&rpc2_job_lock);
+    }
+    if(work) {
+        if (!rpc2_blob) {
+            applog(LOG_ERR, "Requested work before work was received");
+            goto err_out;
+        }
+        memcpy(work->data, rpc2_blob, rpc2_bloblen);
+        memset(work->target, 0xff, sizeof(work->target));
+        work->target[7] = rpc2_target;
+        strncpy(work->job_id, rpc2_job_id, 128);
+        work->dlen = rpc2_bloblen;
+    }
+    return true;
+
+    err_out:
+    return false;
+}
+
+static bool work_decode(const json_t *val, struct work *work)
 {
 	json_t *tmp;
 	tmp = json_object_get(job, "job_id");
@@ -632,22 +708,45 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		return true;
 	}
 
-	if(have_stratum)
-	{
-		char *noncestr;
+	if (have_stratum) {
+		uint32_t ntime, nonce;
+		uint16_t nvote;
+		char *ntimestr, *noncestr, *xnonce2str, *nvotestr;
 
-		noncestr = bin2hex(((const unsigned char*)work->data) + 39, 4);
-		char hash[32];
-		cryptonight_hash((void *)hash, (const void *)work->data, 76);
-		char *hashhex = bin2hex((const unsigned char *)hash, 32);
-		snprintf(s, sizeof(s),
-				 "{\"method\": \"submit\", \"params\": {\"id\": \"%s\", \"job_id\": \"%s\", \"nonce\": \"%s\", \"result\": \"%s\"}, \"id\":1}",
-				 rpc2_id, work->job_id, noncestr, hashhex);
-		free(hashhex);
-		free(noncestr);
+        if (jsonrpc_2) {
+            noncestr = bin2hex(((const unsigned char*)work->data) + 39, 4);
+            char hash[32];
+            cryptonight_hash((void *)hash, (const void *)work->data, work->dlen);
+            char *hashhex = bin2hex((const unsigned char *)hash, 32);
+            snprintf(s, JSON_BUF_LEN,
+                    "{\"method\": \"submit\", \"params\": {\"id\": \"%s\", \"job_id\": \"%s\", \"nonce\": \"%s\", \"result\": \"%s\"}, \"id\":1}\r\n",
+                    rpc2_id, work->job_id, noncestr, hashhex);
+            free(hashhex);
+        } else {
+            le32enc(&ntime, work->data[17]);
+            le32enc(&nonce, work->data[19]);
+            be16enc(&nvote, *((uint16_t*)&work->data[20]));
 
-		if(unlikely(!stratum_send_line(&stratum, s)))
-		{
+            ntimestr = bin2hex((const unsigned char *)(&ntime), 4);
+            noncestr = bin2hex((const unsigned char *)(&nonce), 4);
+            xnonce2str = bin2hex(work->xnonce2, work->xnonce2_len);
+            nvotestr = bin2hex((const unsigned char *)(&nvote), 2);
+            if (opt_algo == ALGO_HEAVY) {
+                sprintf(s,
+                    "{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
+                    rpc_user, work->job_id, xnonce2str, ntimestr, noncestr, nvotestr);
+            } else {
+                sprintf(s,
+                    "{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
+                    rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
+            }
+            free(ntimestr);
+            free(xnonce2str);
+            free(nvotestr);
+        }
+        free(noncestr);
+
+		if (unlikely(!stratum_send_line(&stratum, s))) {
 			applog(LOG_ERR, "submit_upstream_work stratum_send_line failed");
 			free(str);
 			return rc;
@@ -718,7 +817,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
         if(jsonrpc_2) {
             char *noncestr = bin2hex(((const unsigned char*)work->data) + 39, 4);
             char hash[32];
-            cryptonight_hash((void *)hash, (const void *)work->data, 76);
+            cryptonight_hash((void *)hash, (const void *)work->data, work->dlen);
             char *hashhex = bin2hex((const unsigned char *)hash, 32);
             snprintf(s, JSON_BUF_LEN,
                     "{\"method\": \"submit\", \"params\": {\"id\": \"%s\", \"job_id\": \"%s\", \"nonce\": \"%s\", \"result\": \"%s\"}, \"id\":1}\r\n",
@@ -1147,7 +1246,7 @@ static void *miner_thread(void *userdata)
 			pthread_mutex_lock(&g_work_lock);
             if ((*nonceptr) >= end_nonce
            	    && !(jsonrpc_2 ? memcmp(work.data, g_work.data, 39) ||
-           	            memcmp(((uint8_t*) work.data) + 43, ((uint8_t*) g_work.data) + 43, 33)
+           	            memcmp(((uint8_t*) work.data) + 43, ((uint8_t*) g_work.data) + 43, work.dlen-43)
            	      : memcmp(work.data, g_work.data, 76)))
             {
                 stratum_gen_work(&stratum, &g_work);
@@ -1169,10 +1268,7 @@ static void *miner_thread(void *userdata)
 				g_work_time = time(NULL);
 			}
 		}
-		if(memcmp(work.data, g_work.data, 39) || memcmp(((uint8_t*)work.data) + 43, ((uint8_t*)g_work.data) + 43, 33))
-		{
-			if(opt_debug)
-				applog(LOG_DEBUG, "GPU #%d: %s, got new work", device_map[thr_id], device_name[thr_id]);
+        if (jsonrpc_2 ? memcmp(work.data, g_work.data, 39) || memcmp(((uint8_t*) work.data) + 43, ((uint8_t*) g_work.data) + 43, work.dlen - 43) : memcmp(work.data, g_work.data, 76)) {
 			memcpy(&work, &g_work, sizeof(struct work));
             nonceptr = (uint32_t*) (((char*)work.data) + (jsonrpc_2 ? 39 : 76));
             *nonceptr = 0xffffffffU / opt_n_threads * thr_id;
@@ -1206,7 +1302,8 @@ static void *miner_thread(void *userdata)
 
 		uint32_t results[2];
 		/* scan nonces for a proof-of-work hash */
-		rc = scanhash_cryptonight(thr_id, work.data, work.target,	max_nonce, &hashes_done, results);
+        rc = scanhash_cryptonight(thr_id, work.data, work.dlen, work.target,
+                              max_nonce, &hashes_done);
 
 		thr_totalhashes[thr_id] += hashes_done;
 
@@ -1436,7 +1533,8 @@ static void *daemon_thread(void *userdata) {
                     if (opt_debug)
                         applog(LOG_DEBUG, "DEBUG: got new work");
                     pthread_mutex_lock(&g_work_lock);
-                    hex2bin((unsigned char *)g_work.data, hasher, strlen(hasher)/2);
+                    g_work.dlen = strlen(hasher)/2;
+                    hex2bin((unsigned char *)g_work.data, hasher, g_work.dlen);
                     diff = 0xffffffffffffffffUL / diff;
                     g_work.target[6] = diff & 0xffffffff;
                     g_work.target[7] = diff >> 32;

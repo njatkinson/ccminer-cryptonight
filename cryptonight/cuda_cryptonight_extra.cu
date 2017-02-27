@@ -12,9 +12,10 @@
 typedef unsigned char BitSequence;
 typedef unsigned long long DataLength;
 
-static uint32_t *d_input[MAX_GPU];
-static uint32_t *d_target[MAX_GPU];
-static uint32_t *d_resultNonce[MAX_GPU];
+static uint32_t d_inlen[8];
+static uint32_t *d_input[8];
+static uint32_t *d_target[8];
+static uint32_t *d_resultNonce[8];
 
 #include "cuda_cryptonight_keccak.cu"
 #include "cuda_cryptonight_blake.cu"
@@ -42,7 +43,7 @@ __constant__ uint8_t d_sub_byte[16][16] =
 	{0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16}
 };
 
-__device__ __forceinline__ void cryptonight_aes_set_key(uint32_t * __restrict__ key, const uint32_t * __restrict__ data)
+__device__ void cryptonight_aes_set_key( uint32_t *key, const uint32_t *data )
 {
 	int i, j;
 	uint8_t temp[4];
@@ -72,116 +73,106 @@ __device__ __forceinline__ void cryptonight_aes_set_key(uint32_t * __restrict__ 
 	}
 }
 
-__global__ void cryptonight_extra_gpu_prepare(int threads, const uint32_t * __restrict__ d_input, uint32_t startNonce, uint32_t * __restrict__ d_ctx_state, uint32_t * __restrict__ d_ctx_a, uint32_t * __restrict__ d_ctx_b, uint32_t * __restrict__ d_ctx_key1, uint32_t * __restrict__ d_ctx_key2)
+__global__ void cryptonight_extra_gpu_prepare(int threads, uint32_t *d_input, int inlen, uint32_t startNonce, struct cryptonight_gpu_ctx *d_ctx)
 {
-	int thread = (blockDim.x * blockIdx.x + threadIdx.x);
+    int thread = (blockDim.x * blockIdx.x + threadIdx.x);
+    
+    if (thread < threads)
+    {
+        struct cryptonight_gpu_ctx ctx;
+        uint32_t input[32];
 
-	if(thread < threads)
-	{
-		uint64_t ctx_state[25];
-		uint32_t ctx_a[4];
-		uint32_t ctx_b[4];
-		uint32_t ctx_key1[40] = {0};
-		uint32_t ctx_key2[40] = {0};
-		uint32_t input[19];
+        memcpy(input, d_input, inlen);
+        *((uint32_t *)(((char *)input) + 39)) = startNonce + thread;
+        
+        cn_keccak((uint8_t *)input, inlen, (uint8_t *)ctx.state);
+        cryptonight_aes_set_key(ctx.key1, ctx.state);
+        cryptonight_aes_set_key(ctx.key2, ctx.state+8);
+        XOR_BLOCKS_DST(ctx.state, ctx.state+8, ctx.a);
+        XOR_BLOCKS_DST(ctx.state+4, ctx.state+12, ctx.b);
 
-		MEMCPY4(input, d_input, 19);
-
-		uint32_t nonce = startNonce + thread;
-		*(((uint8_t *)input) + 39) = nonce & 0xff;
-		*(((uint8_t *)input) + 40) = (nonce >> 8) & 0xff;
-		*(((uint8_t *)input) + 41) = (nonce >> 16) & 0xff;
-		*(((uint8_t *)input) + 42) = (nonce >> 24) & 0xff;
-
-		cn_keccak(input, ctx_state);
-		cryptonight_aes_set_key(ctx_key1, (uint32_t*)ctx_state);
-		cryptonight_aes_set_key(ctx_key2, (uint32_t*)(ctx_state + 4));
-		XOR_BLOCKS_DST(ctx_state, ctx_state + 4, ctx_a);
-		XOR_BLOCKS_DST(ctx_state + 2, ctx_state + 6, ctx_b);
-
-		MEMCPY4(d_ctx_state + thread * 50, ctx_state, 50);
-		MEMCPY4(d_ctx_a + thread * 4, ctx_a, 4);
-		MEMCPY4(d_ctx_b + thread * 4, ctx_b, 4);
-		MEMCPY4(d_ctx_key1 + thread * 40, ctx_key1, 40);
-		MEMCPY4(d_ctx_key2 + thread * 40, ctx_key2, 40);
-	}
+        memcpy(&d_ctx[thread], &ctx, sizeof(struct cryptonight_gpu_ctx));
+    }
 }
 
 __global__ void cryptonight_extra_gpu_final(int threads, uint32_t startNonce, const uint32_t * __restrict__ d_target, uint32_t * __restrict__ resNonce, const uint32_t * __restrict__ d_ctx_state)
 {
-	const int thread = blockDim.x * blockIdx.x + threadIdx.x;
-	
-	if(thread < threads)
-	{
-		int i;
-		const uint32_t nonce = startNonce + thread;
-		const uint32_t * __restrict__ ctx_state = d_ctx_state + thread * 50;
-		uint32_t hash[8];
-		uint32_t state[50];
+    int thread = (blockDim.x * blockIdx.x + threadIdx.x);
+   
+    if (thread < threads)
+    {
+        MY_ALIGN(8)uint32_t state[50];
+        int i;
+        uint32_t nonce = startNonce + thread;
+        struct cryptonight_gpu_ctx *ctx = &d_ctx[thread];
+        uint32_t hash[8];
 
-#pragma unroll
-		for(i = 0; i < 50; i++)
-			state[i] = ctx_state[i];
+        MEMCPY8(state, &ctx->state, 25);
+        cn_keccakf((uint64_t *)state);
 
-		cn_keccakf2((uint64_t *)state);
+        switch( ((uint8_t *)state)[0] & 0x03 ) {
+            case 0:
+                cn_blake((const uint8_t *)state, 200, (uint8_t *)hash);
+                break;
+            case 1:
+                cn_groestl((const BitSequence *)state, 200, (BitSequence *)hash);
+                break;
+            case 2:
+                cn_jh((const BitSequence *)state, 200, (BitSequence *)hash);
+                break;
+            case 3:
+                cn_skein((const BitSequence *)state, 200, (BitSequence *)hash);
+                break;
+            default:
+                break;
+        }
 
-		int branch = ((uint8_t *)state)[0] & 0x03;
-		if(branch == 0)
-			cn_blake((const uint8_t *)state, 200, (uint8_t *)hash);
-		if(branch == 1)
-			cn_groestl((const BitSequence *)state, 200, (BitSequence *)hash);
-		if(branch == 2)
-			cn_jh((const BitSequence *)state, 200, (BitSequence *)hash);
-		if(branch == 3)
-			cn_skein((const BitSequence *)state, 200, (BitSequence *)hash);
+        int position = -1;
+        bool rc = true;
 
-		int position = -1;
-		bool rc = true;
-
+#if 0
 #pragma unroll 8
-		for(i = 7; i >= 0; i--)
-		{
-			if(hash[i] > d_target[i])
-			{
-				if(position < i)
-				{
-					position = i;
-					rc = false;
-				}
-			}
-			if(hash[i] < d_target[i])
-			{
-				if(position < i)
-				{
-					position = i;
-					rc = true;
-				}
-			}
-		}
+#endif
+        for (i = 7; i >= 0; i--) {
+            if (hash[i] > d_target[i]) {
+                if(position < i) {
+                    position = i;
+                    rc = false;
+                }
+             }
+             if (hash[i] < d_target[i]) {
+                if(position < i) {
+                    position = i;
+                    rc = true;
+                }
+             }
+        }
 
-		if(rc == true)
-		{
-			uint32_t tmp = atomicExch(resNonce, nonce);
-			if(tmp != 0xffffffff)
-				resNonce[1] = tmp;
-		}
-	}
+        if(rc == true)
+            if(resNonce[0] > nonce)
+                resNonce[0] = nonce;
+    }
 }
 
 __host__ void cryptonight_extra_cpu_setData(int thr_id, const void *data, const void *pTargetIn)
 {
-	cudaMemcpy(d_input[thr_id], data, 19 * sizeof(uint32_t), cudaMemcpyHostToDevice);
-	cudaMemcpy(d_target[thr_id], pTargetIn, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice);
-	cudaMemset(d_resultNonce[thr_id], 0xFF, 2 * sizeof(uint32_t));
-	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
+    cudaMemcpy(d_input[thr_id], data, d_inlen[thr_id], cudaMemcpyHostToDevice);
+    cudaMemcpy(d_target[thr_id], pTargetIn, 8*sizeof(uint32_t), cudaMemcpyHostToDevice);
 }
 
-__host__ void cryptonight_extra_cpu_init(int thr_id)
+__host__ void cryptonight_extra_cpu_init(int thr_id, int inlen)
 {
-	cudaMalloc(&d_input[thr_id], 19 * sizeof(uint32_t));
-	cudaMalloc(&d_target[thr_id], 8 * sizeof(uint32_t));
-	cudaMalloc(&d_resultNonce[thr_id], 2*sizeof(uint32_t));
-	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
+    d_inlen[thr_id] = inlen;
+    cudaMalloc(&d_input[thr_id], inlen); 
+    cudaMalloc(&d_target[thr_id], 8*sizeof(uint32_t)); 
+    cudaMalloc(&d_resultNonce[thr_id], sizeof(uint32_t)); 
+    cudaMemcpyToSymbol(keccakf_rndc, h_keccakf_rndc, sizeof(h_keccakf_rndc), 0, cudaMemcpyHostToDevice);
+	cudaMemcpyToSymbol(d_sub_byte, sub_byte, sizeof(sub_byte), 0, cudaMemcpyHostToDevice);
+	cudaMemcpyToSymbol(d_blake_sigma, h_blake_sigma, sizeof(h_blake_sigma), 0, cudaMemcpyHostToDevice);
+	cudaMemcpyToSymbol(d_blake_cst, h_blake_cst, sizeof(h_blake_cst), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_groestl_T, h_groestl_T, sizeof(h_groestl_T), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_JH256_H0, h_JH256_H0, sizeof(h_JH256_H0), 0, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_E8_rc, h_E8_rc, sizeof(h_E8_rc), 0, cudaMemcpyHostToDevice);
 }
 
 __host__ void cryptonight_extra_cpu_prepare(int thr_id, int threads, uint32_t startNonce, uint32_t *d_ctx_state, uint32_t *d_ctx_a, uint32_t *d_ctx_b, uint32_t *d_ctx_key1, uint32_t *d_ctx_key2)
@@ -191,8 +182,8 @@ __host__ void cryptonight_extra_cpu_prepare(int thr_id, int threads, uint32_t st
 	dim3 grid((threads + threadsperblock - 1) / threadsperblock);
 	dim3 block(threadsperblock);
 
-	cryptonight_extra_gpu_prepare << <grid, block >> >(threads, d_input[thr_id], startNonce, d_ctx_state, d_ctx_a, d_ctx_b, d_ctx_key1, d_ctx_key2);
-	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
+    cryptonight_extra_gpu_prepare<<<grid, block, shared_size>>>(threads, d_input[thr_id], d_inlen[thr_id], startNonce, d_ctx);
+    cudaDeviceSynchronize();
 }
 
 __host__ void cryptonight_extra_cpu_final(int thr_id, int threads, uint32_t startNonce, uint32_t *resnonce, uint32_t *d_ctx_state)
