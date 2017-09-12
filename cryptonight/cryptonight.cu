@@ -49,8 +49,16 @@ extern "C" int cuda_num_devices()
 }
 extern "C" void cuda_set_device_config(int GPU_N)
 {
+	size_t freeMemory = 0;
+	size_t totalMemoery = 0;
+
 	for(int i = 0; i < GPU_N; i++)
 	{
+
+		cudaError_t err = cudaMemGetInfo(&freeMemory, &totalMemoery);
+		if(err == cudaSuccess)
+			applog(LOG_DEBUG, "GPU #%d: %zu bytes free, %zu bytes total", device_map[i], freeMemory, totalMemoery);
+
 		if(device_config[i][0] == 0)
 		{
 			device_config[i][0] = device_mpcount[i] * 4;
@@ -205,6 +213,7 @@ extern "C" int scanhash_cryptonight(int thr_id, uint32_t *pdata, const uint32_t 
 		cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
 		cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 		cudaMalloc(&d_long_state[thr_id], alloc);
+		applog(LOG_DEBUG, "GPU #%d: allocating %zu bytes (d_long_state)", device_map[thr_id], alloc);
 		exit_if_cudaerror(thr_id, __FILE__, __LINE__);
 		cudaMalloc(&d_ctx_state[thr_id], 50 * sizeof(uint32_t) * throughput);
 		exit_if_cudaerror(thr_id, __FILE__, __LINE__);

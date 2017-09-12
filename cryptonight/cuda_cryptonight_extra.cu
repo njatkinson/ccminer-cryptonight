@@ -183,7 +183,9 @@ __host__ void cryptonight_extra_cpu_setData(int thr_id, const void *data, const 
 __host__ void cryptonight_extra_cpu_init(int thr_id)
 {
 	cudaMalloc(&d_input[thr_id], 19 * sizeof(uint32_t));
+	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
 	cudaMalloc(&d_target[thr_id], 8 * sizeof(uint32_t));
+	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
 	cudaMalloc(&d_resultNonce[thr_id], 2*sizeof(uint32_t));
 	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
 }
@@ -196,6 +198,7 @@ __host__ void cryptonight_extra_cpu_prepare(int thr_id, int threads, uint32_t st
 	dim3 block(threadsperblock);
 
 	cryptonight_extra_gpu_prepare << <grid, block >> >(threads, d_input[thr_id], startNonce, d_ctx_state, d_ctx_a, d_ctx_b, d_ctx_key1, d_ctx_key2);
+	cudaDeviceSynchronize();
 	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
 }
 
@@ -208,6 +211,7 @@ __host__ void cryptonight_extra_cpu_final(int thr_id, int threads, uint32_t star
 
 	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
 	cryptonight_extra_gpu_final << <grid, block >> >(threads, startNonce, d_target[thr_id], d_resultNonce[thr_id], d_ctx_state);
+	cudaDeviceSynchronize();
 	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
 	cudaMemcpy(resnonce, d_resultNonce[thr_id], 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost);
 	exit_if_cudaerror(thr_id, __FILE__, __LINE__);
