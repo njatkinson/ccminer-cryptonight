@@ -205,7 +205,7 @@ extern "C" int scanhash_cryptonight(int thr_id, uint32_t *pdata, const uint32_t 
 		applog(LOG_ERR, "GPU %d: PLEASE REDUCE THE NUMBER OF THREADS OR BLOCKS", device_map[thr_id]);
 		exit(1);
 	}
-	const size_t alloc = MEMORY * throughput;
+	const size_t alloc = MEMORY * (size_t)throughput;
 
 	static bool init[MAX_GPU] = {false, false, false, false, false, false, false, false};
 	if(!init[thr_id])
