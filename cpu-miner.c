@@ -141,13 +141,13 @@ static const bool opt_time = true;
 static int opt_n_threads = 0;
 static double opt_difficulty = 1; // CH
 static int num_processors;
-int device_map[8] = {0, 1, 2, 3, 4, 5, 6, 7}; // CB
-char *device_name[8]; // CB
-int device_arch[8][2];
-int device_mpcount[8];
-int device_bfactor[8];
-int device_bsleep[8];
-int device_config[8][2];
+int device_map[MAX_GPU]; // CB
+char *device_name[MAX_GPU]; // CB
+int device_arch[MAX_GPU][2];
+int device_mpcount[MAX_GPU];
+int device_bfactor[MAX_GPU];
+int device_bsleep[MAX_GPU];
+int device_config[MAX_GPU][2];
 #ifdef WIN32
 static int default_bfactor = 6;
 static int default_bsleep = 100;
@@ -262,18 +262,13 @@ Usage: " PROGRAM_NAME " [OPTIONS]\n\
 ";
 
 static char const short_options[] =
-#ifndef WIN32
-"B"
-#endif
 #ifdef HAVE_SYSLOG_H
 "S"
 #endif
-"c:Dhp:Px:kqr:R:s:t:T:o:u:O:Vd:f:l:";
+"Bc:Dhp:Px:kqr:R:s:t:T:o:u:O:Vd:f:l:";
 
 static struct option const options[] = {
-#ifndef WIN32
 	{"background", 0, NULL, 'B'},
-#endif
 	{"benchmark", 0, NULL, 1005},
 	{"cert", 1, NULL, 1001},
 	{"config", 1, NULL, 'c'},
@@ -325,6 +320,8 @@ void cuda_devicereset(int threads)
 			cudaDeviceSynchronize();
 			cudaDeviceReset();
 		}
+		else
+			applog(LOG_WARNING, "can't reset GPU #%d", device_map[i]);
 	}
 }
 
@@ -1678,13 +1675,14 @@ static void parse_arg(int key, char *arg)
 			break;
 		case 'l':			/* cryptonight launch config */
 		{
-			char *tmp_config[8];
+			char *tmp_config[MAX_GPU];
 			int tmp_blocks = opt_cn_blocks, tmp_threads = opt_cn_threads;
-			for(i = 0; i < 8; i++) tmp_config[i] = NULL;
+			for(i = 0; i < MAX_GPU; i++)
+				tmp_config[i] = NULL;
 			p = strtok(arg, ",");
 			if(p == NULL) show_usage_and_exit(1);
 			i = 0;
-			while(p != NULL && i < 8)
+			while(p != NULL && i < MAX_GPU)
 			{
 				tmp_config[i++] = strdup(p);
 				p = strtok(NULL, ",");
@@ -1695,7 +1693,7 @@ static void parse_arg(int key, char *arg)
 				i++;
 			}
 
-			for(i = 0; i < 8; i++)
+			for(i = 0; i < MAX_GPU; i++)
 			{
 				parse_device_config(i, tmp_config[i], &tmp_blocks, &tmp_threads);
 				device_config[i][0] = tmp_blocks;
@@ -1709,7 +1707,7 @@ static void parse_arg(int key, char *arg)
 			if(p == NULL) show_usage_and_exit(1);
 			int last;
 			i = 0;
-			while(p != NULL && i < 8)
+			while(p != NULL && i < MAX_GPU)
 			{
 				device_bfactor[i++] = last = atoi(p);
 				if(last < 0 || last > 10)
@@ -1719,7 +1717,7 @@ static void parse_arg(int key, char *arg)
 				}
 				p = strtok(NULL, ",");
 			}
-			while(i < 8)
+			while(i < MAX_GPU)
 			{
 				device_bfactor[i++] = last;
 			}
@@ -1730,7 +1728,7 @@ static void parse_arg(int key, char *arg)
 			if(p == NULL) show_usage_and_exit(1);
 			int last;
 			i = 0;
-			while(p != NULL && i < 8)
+			while(p != NULL && i < MAX_GPU)
 			{
 				device_bsleep[i++] = last = atoi(p);
 				if(last < 0 || last > 1000000)
@@ -1740,7 +1738,7 @@ static void parse_arg(int key, char *arg)
 				}
 				p = strtok(NULL, ",");
 			}
-			while(i < 8)
+			while(i < MAX_GPU)
 			{
 				device_bsleep[i++] = last;
 			}
@@ -1860,22 +1858,24 @@ static int msver(void)
 {
 	int version;
 #ifdef _MSC_VER
-	switch(_MSC_VER)
+	switch(_MSC_VER/100)
 	{
-		case 1500: version = 2008; break;
-		case 1600: version = 2010; break;
-		case 1700: version = 2012; break;
-		case 1800: version = 2013; break;
-		case 1900: version = 2015; break;
+		case 15: version = 2008; break;
+		case 16: version = 2010; break;
+		case 17: version = 2012; break;
+		case 18: version = 2013; break;
+		case 19: version = 2015; break;
 		default: version = _MSC_VER / 100;
 	}
+	if(_MSC_VER > 1900)
+		version = 2017;
 #else
 	version = 0;
 #endif
 	return version;
 }
 
-#define PROGRAM_VERSION "2.04"
+#define PROGRAM_VERSION "2.05"
 int main(int argc, char *argv[])
 {
 	struct thr_info *thr;
@@ -1915,9 +1915,18 @@ int main(int argc, char *argv[])
 	
 	pthread_mutex_init(&applog_lock, NULL);
 	num_processors = cuda_num_devices();
-
-	for(i = 0; i < 8; i++)
+	if(num_processors == 0)
 	{
+		applog(LOG_ERR, "No CUDA devices found! terminating.");
+		exit(EXIT_FAILURE);
+	}
+
+	if(!opt_n_threads)
+		opt_n_threads = num_processors;
+
+	for(i = 0; i < MAX_GPU; i++)
+	{
+		device_map[i] = i;
 		device_bfactor[i] = default_bfactor;
 		device_bsleep[i] = default_bsleep;
 		device_config[i][0] = opt_cn_blocks;
@@ -1974,17 +1983,11 @@ int main(int argc, char *argv[])
 	}
 	signal(SIGINT, signal_handler); 
 #else
+	if(opt_background)
+		applog(LOG_WARNING, "option -B is not supported under Windows");
 	SetConsoleCtrlHandler((PHANDLER_ROUTINE)ConsoleHandler, TRUE);
 	SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
 #endif
-
-	if(num_processors == 0)
-	{
-		applog(LOG_ERR, "No CUDA devices found! terminating.");
-		proper_exit(EXIT_FAILURE);
-	}
-	if(!opt_n_threads)
-		opt_n_threads = num_processors;
 
 #ifdef HAVE_SYSLOG_H
 	if(use_syslog)
