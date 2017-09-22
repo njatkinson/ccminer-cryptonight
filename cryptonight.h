@@ -21,7 +21,7 @@ struct uint3  blockDim;
 #define __umul64hi(x, y) (x*y)
 #endif
 
-#define MEMORY         (1ULL << 21) // 2 MiB / 2097152 B
+#define MEMORY         2097152ULL // 2 MiB / 2097152 B
 #define ITER           (1 << 20) // 1048576
 #define AES_BLOCK_SIZE  16
 #define AES_KEY_SIZE    32
