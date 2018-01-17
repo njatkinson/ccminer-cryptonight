@@ -3,9 +3,14 @@
 If you find this tool useful and like to support its continued development,
 then consider a donation.
 
-## KlausT's donation address:
-* BTC: 1QHH2dibyYL5iyMDk3UN4PVvFVtrWD8QKp
-* BCH: 1AH1u7B4KtDTUBgmT6NrXyahNEgTac3fL7
+March 31st 2016
+---------------
+
+Support for solo mining with bitmonerod v0.9.3.1 or newer. Specify your url
+as "daemon+tcp://<host>:<port>/json_rpc"
+
+July 5th 2014
+-------------
 
 ## tsiv's donation adresses:
 * BTC: 1JHDKp59t1RhHFXsTw2UQpR3F9BBz3R3cs
